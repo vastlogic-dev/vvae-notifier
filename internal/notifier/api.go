@@ -123,7 +123,7 @@ type tokenInfo struct {
 	err       string
 }
 
-// fetchTokenInfo：过期时间 = created + expiration（regular 权限可查，2026-09-29 实测）。
+// fetchTokenInfo：过期时间 = created + expiration（regular 权限可查）。
 func (p *Poller) fetchTokenInfo(pat string) tokenInfo {
 	res, err := p.getV2EX(apiBase+"/token", "", pat)
 	if err != nil {

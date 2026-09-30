@@ -14,7 +14,7 @@
 ### Docker
 
 ```sh
-docker run -d --name vvae-notifier --restart=always \
+docker run -d --name vvae-notifier --hostname "$(hostname)" --restart=always \
   -v vvae-notifier:/data \
   -e VVAE_KEY='vvaepush1.…' \
   ghcr.io/vastlogic-dev/vvae-notifier:latest
@@ -22,7 +22,7 @@ docker run -d --name vvae-notifier --restart=always \
 
 有多个 V2EX 账号时，每个账号一个部署串，放在同一个 `VVAE_KEY` 里用逗号隔开，一个容器全部轮询。
 App 推送设置里「复制 Docker 命令」给出的就是包含所有账号的完整命令，它会先删掉同名的旧容器再启动。
-命令里的 `--hostname "$(hostname)"` 让容器沿用宿主机的名字，App 里能看出轮询程序跑在哪台机器上；
+`--hostname "$(hostname)"` 让容器沿用宿主机的名字，App 里能看出轮询程序跑在哪台机器上；
 同一个部署串在几处运行时，每条提醒会重复推送，App 会显示「N 个轮询程序在运行」并列出各自的机器。
 
 或用 [docker-compose.yml](docker-compose.yml)：把部署串写进同目录的 `.env`（`VVAE_KEY=vvaepush1.…`），再 `docker compose up -d`。
@@ -35,6 +35,15 @@ App 推送设置里「复制 Docker 命令」给出的就是包含所有账号�
 ```sh
 sudo chown 65532:65532 /volume1/docker/vvae
 ```
+
+### 更新
+
+```sh
+docker pull ghcr.io/vastlogic-dev/vvae-notifier:latest
+```
+
+再执行一遍部署命令。App 复制的命令会先删掉旧容器；自己写的命令先 `docker rm -f vvae-notifier`。
+用 compose 时：`docker compose pull && docker compose up -d`。
 
 ### 直接运行二进制
 
@@ -72,6 +81,7 @@ Linux 写宿主机的局域网 IP 或加 `--network host`。例如 `-e HTTPS_PRO
 
 - V2EX：
   - 轮询 `/api/v2/notifications`（默认每 30 秒）或提醒 Feed（默认每 60 秒）。
+    V2EX 按 IP 限制每小时 600 次 API 请求；一个容器放多个账号时自动拉长间隔，合计不超过 420 次。
   - 用 PAT 时，每天查一次 `/api/v2/token` 的过期时间。
   - 请求都带 `If-None-Match`，UA 为 `vvae-notifier/<版本>`。
 - VVAE 中继：拉配置、发加密推送、每 5 分钟一次心跳。

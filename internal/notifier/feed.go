@@ -128,7 +128,7 @@ func (p *Poller) fetchFeed(feedURL, etag string) fetchResult {
 	if err != nil {
 		return fetchFailed(netDetail(err))
 	}
-	// 令牌不存在（被「重新生成 Token」作废）时，V2EX 返回 200 和空正文，不是 404（2026-09-29 实测）。
+	// 令牌不存在（被「重新生成 Token」作废）时，V2EX 返回 200 和空正文，不是 404。
 	if len(bytes.TrimSpace(data)) == 0 {
 		return fetchResult{kind: fetchInvalid, remaining: -1, resetAt: -1, empty: true}
 	}

@@ -74,7 +74,7 @@ func thankNotification(id, created int64) testNotification {
 
 type testEntry struct{ title, link, published, author, content string }
 
-// feedXML 的结构照抄真实提醒 Feed（2026-09-29），内容编造。
+// feedXML 的结构照抄真实提醒 Feed，内容编造。
 func feedXML(entries ...testEntry) string {
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>
@@ -323,7 +323,10 @@ type testLogger struct{ t *testing.T }
 func (l testLogger) Infof(f string, a ...any) { l.t.Logf(f, a...) }
 func (l testLogger) Warnf(f string, a ...any) { l.t.Logf("[warn] "+f, a...) }
 
-func (w *world) newPoller(store Store) *Poller {
+func (w *world) newPoller(store Store) *Poller { return w.newPollerSharing(store, 1) }
+
+// newPollerSharing：apiShare 个部署串在同一进程里共用 V2EX API 限额。
+func (w *world) newPollerSharing(store Store, apiShare int) *Poller {
 	w.t.Helper()
 	p, err := New(Options{
 		Deploy:   w.deploy,
@@ -333,6 +336,7 @@ func (w *world) newPoller(store Store) *Poller {
 		Now:      func() time.Time { return w.now },
 		Log:      testLogger{w.t},
 		Hostname: "nas-01",
+		APIShare: apiShare,
 	})
 	if err != nil {
 		w.t.Fatal(err)

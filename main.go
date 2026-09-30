@@ -89,6 +89,7 @@ func main() {
 			Version:  version,
 			Log:      plog,
 			Hostname: hostname,
+			APIShare: len(deploys),
 		})
 		if err != nil {
 			fail(err.Error())

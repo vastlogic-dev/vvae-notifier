@@ -63,7 +63,7 @@ func (r *relayClient) call(method, path string, body any, ifNoneMatch string) (i
 	case res.StatusCode == http.StatusTooManyRequests || res.StatusCode >= 500:
 		e := &relayError{kind: relayRetry, detail: fmt.Sprintf("HTTP %d", res.StatusCode)}
 		if s, err := strconv.Atoi(res.Header.Get("Retry-After")); err == nil && s > 0 {
-			e.after = time.Duration(s) * time.Second
+			e.after = time.Duration(min(s, 3600)) * time.Second // 最多等一小时
 		}
 		return 0, nil, e
 	case err != nil:

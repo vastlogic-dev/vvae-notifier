@@ -281,6 +281,56 @@ func TestRestartResumesWithoutDuplicates(t *testing.T) {
 	}
 }
 
+func TestInstanceSurvivesRestart(t *testing.T) {
+	w, store, run := setup(t, apiCfg)
+	run(0)
+	first := w.lastHeartbeat().Inst
+	w.advance(time.Minute)
+	w.newPoller(store).Tick() // 新进程
+	if hb := w.lastHeartbeat(); hb.Inst != first {
+		t.Fatalf("重启后实例 id 变了：%q → %q", first, hb.Inst)
+	}
+	w.setConfig(with(apiCfg, "v", 2, "pat", "pat-2222-3333")) // 换凭据：清状态、重新记基线
+	run(5 * time.Minute)
+	run(time.Second)
+	if s := store.state(); s.Inst != first || s.Cfg == nil || s.Cfg.V != 2 {
+		t.Fatalf("换凭据后实例 id 应保留：%q，配置 %+v", s.Inst, s.Cfg)
+	}
+}
+
+func TestSharedAPIBudget(t *testing.T) {
+	// 一小时内请求 V2EX 的次数：一个部署串按配置的 30 秒；5 个共用限额时每个拉长到 43 秒，合计不超过 600 的 70%。
+	perHour := func(share int) int {
+		w := newWorld(t)
+		w.setConfig(apiCfg)
+		p := w.newPollerSharing(&memoryStore{}, share)
+		p.Tick()
+		before := w.v2exRequests()
+		for end := w.now.Add(time.Hour); w.now.Before(end); {
+			w.advance(p.Tick())
+		}
+		return w.v2exRequests() - before
+	}
+	if n := perHour(1); n < 118 || n > 122 {
+		t.Fatalf("单个部署串一小时 %d 次，应约 120", n)
+	}
+	if n := perHour(5); n*5 > apiHourlyBudget || n < 80 {
+		t.Fatalf("5 个部署串时每个一小时 %d 次，合计应不超过 %d", n, apiHourlyBudget)
+	}
+}
+
+func TestBaselineIgnoresFastLocalClock(t *testing.T) {
+	// 本机时钟比 V2EX 快：记基线之后 V2EX 上新产生的提醒，时间仍早于本机的「现在」，也要推送。
+	w, _, run := setup(t, apiCfg)
+	w.notifications = []testNotification{replyNotification(1, w.sec()-600, "alice", 100, 3)}
+	run(0)
+	w.notifications = append([]testNotification{replyNotification(2, w.sec()-300, "bob", 100, 4)}, w.notifications...)
+	run(30 * time.Second)
+	if len(w.pushes) != 1 {
+		t.Fatalf("基线后的新提醒被当成旧的：推送 %d 条", len(w.pushes))
+	}
+}
+
 func TestRejectedPushDropped(t *testing.T) {
 	w, store, run := setup(t, apiCfg)
 	run(0)

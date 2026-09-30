@@ -31,6 +31,8 @@ type State struct {
 	NextTokenCheck int64 `json:"nextTokenCheck"`
 	// 待发往中继的密文，中继暂时不可达时保留，最多 50 条。
 	Outbox []string `json:"outbox"`
+	// 实例 id（协议 inst），首次启动生成，换轮询源时也保留。
+	Inst string `json:"inst,omitempty"`
 }
 
 const (
@@ -44,7 +46,7 @@ type Store interface {
 	Save(*State) error
 }
 
-// FileStore 把状态存成 <dir>/<name>，先写临时文件再改名，写到一半断电也不会坏。
+// FileStore 把状态存成 <dir>/<name>，先写临时文件再改名，不会留下写了一半的文件。
 type FileStore struct{ dir, name string }
 
 func NewFileStore(dir, name string) *FileStore { return &FileStore{dir, name} }

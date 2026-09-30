@@ -24,6 +24,8 @@ const (
 	tokenCheckRetry = time.Hour
 	revokedRetry    = 30 * time.Minute
 	lowRemaining    = 60
+	// V2EX API 按 IP 限额每小时 600 次；同一进程的 API 轮询合计不超过它的 70%，给用户在同一 IP 上的其他用途留余量。
+	apiHourlyBudget = 600 * 7 / 10
 	// 提醒源连续这么多次返回空正文才判失效（间隔按错误退避，约 6 分钟，超过边缘缓存的 150 秒）。
 	emptyConfirm = 3
 )
@@ -57,6 +59,8 @@ type Options struct {
 	Log     Logger
 	// 主机名，随心跳加密上报，App 用来标出轮询程序在哪台机器上。容器里是容器的主机名。
 	Hostname string
+	// 同一进程里一起轮询的部署串数，共用一个出口 IP 的 V2EX API 限额；缺省 1。
+	APIShare int
 }
 
 type Poller struct {
@@ -70,6 +74,8 @@ type Poller struct {
 	relay     *relayClient
 	// 本进程的实例 id 与加密后的机器信息，启动时定下，每次心跳带上。
 	inst, meta string
+	// API 轮询间隔下限：几个部署串共用限额时拉长，合计不超过 apiHourlyBudget。
+	apiFloor time.Duration
 
 	state       *State
 	config      *Config
@@ -102,7 +108,7 @@ func New(o Options) (*Poller, error) {
 	if _, err := rand.Read(inst); err != nil {
 		return nil, err
 	}
-	return &Poller{
+	p := &Poller{
 		inst:       b64.EncodeToString(inst),
 		meta:       instanceMeta(box, o.Hostname, o.Now()),
 		store:      o.Store,
@@ -115,18 +121,29 @@ func New(o Options) (*Poller, error) {
 		relay:      &relayClient{base: o.Deploy.Relay, pushKey: o.Deploy.PushKey, userAgent: ua, client: o.Client},
 		status:     statusNoConfig,
 		wantConfig: true,
-	}, nil
+		apiFloor:   time.Duration((3600*max(o.APIShare, 1)+apiHourlyBudget-1)/apiHourlyBudget) * time.Second,
+	}
+	p.loadState()
+	return p, nil
+}
+
+// loadState 读状态、恢复配置。实例 id 随状态保存：同一个部署重启后不变，
+// App 不会把重启前的自己当成另一个在运行的轮询程序。状态里没有时用 New 随机的那个。
+func (p *Poller) loadState() {
+	st, err := p.store.Load()
+	if err != nil {
+		p.log.Warnf("读取状态失败，重新记基线：%v", err)
+	}
+	p.state = st
+	if st.Inst == "" {
+		st.Inst = p.inst
+		p.dirty = true
+	}
+	p.inst = st.Inst
+	p.restoreConfig()
 }
 
 func (p *Poller) Tick() time.Duration {
-	if p.state == nil {
-		st, err := p.store.Load()
-		if err != nil {
-			p.log.Warnf("读取状态失败，重新记基线：%v", err)
-		}
-		p.state = st
-		p.restoreConfig()
-	}
 	now := p.now()
 	if now.Before(p.revokedUntil) {
 		return p.revokedUntil.Sub(now)
@@ -250,7 +267,7 @@ func (p *Poller) applyConfig(cfg *Config, blob string) {
 	s := p.state
 	if fp := cfg.sourceFingerprint(); fp != s.SourceKey {
 		// 换了轮询源或凭据：重新记基线，清掉旧源的状态。
-		*s = State{SourceKey: fp, Outbox: s.Outbox}
+		*s = State{SourceKey: fp, Outbox: s.Outbox, Inst: s.Inst}
 		p.errorStreak = 0
 		p.nextPoll = time.Time{}
 	}
@@ -261,7 +278,20 @@ func (p *Poller) applyConfig(cfg *Config, blob string) {
 	}
 	p.nextHeartbeat = time.Time{} // 尽快上报已应用的配置版本
 	p.dirty = true
-	p.log.Infof("已应用配置 v%d（%s，间隔 %d 秒）", cfg.V, cfg.Source, cfg.Interval)
+	if iv := p.interval(cfg); iv > time.Duration(cfg.Interval)*time.Second {
+		p.log.Infof("已应用配置 v%d（%s，间隔 %d 秒；几个账号共用 V2EX 限额，实际 %d 秒）", cfg.V, cfg.Source, cfg.Interval, int(iv.Seconds()))
+	} else {
+		p.log.Infof("已应用配置 v%d（%s，间隔 %d 秒）", cfg.V, cfg.Source, cfg.Interval)
+	}
+}
+
+// interval 是实际的轮询间隔：配置的间隔，API 源不短于共用限额算出的下限。
+func (p *Poller) interval(cfg *Config) time.Duration {
+	iv := time.Duration(cfg.Interval) * time.Second
+	if cfg.Source == SourceAPI {
+		iv = max(iv, p.apiFloor)
+	}
+	return iv
 }
 
 // ---- 轮询 ----
@@ -275,7 +305,7 @@ func (p *Poller) poll() {
 		r = p.fetchFeed(cfg.FeedURL, s.ETag)
 	}
 	now := p.now()
-	interval := time.Duration(cfg.Interval) * time.Second
+	interval := p.interval(cfg)
 	next := now.Add(interval)
 
 	// 空正文可能是边缘节点偶发的坏响应，单次出现先按错误退避，免得误报失效、来回推系统提醒。
@@ -349,7 +379,12 @@ func (p *Poller) markHealthy(now time.Time) {
 func (p *Poller) ingest(items []Item) {
 	s, cfg := p.state, p.config
 	if s.BaselineT == nil {
-		t := p.now().Unix()
+		// 基线取已有提醒里最新的时间，不看本机时钟：本机比 V2EX 快时，本机时间会把记基线后不久的新提醒当成旧的。
+		// 列表为空才用本机时间，防止之后拉到的历史提醒被当成新的。
+		var t int64
+		if len(items) == 0 {
+			t = p.now().Unix()
+		}
 		s.Seen = []string{}
 		for _, it := range items {
 			t = max(t, it.T)
