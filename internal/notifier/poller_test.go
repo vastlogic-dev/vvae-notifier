@@ -3,6 +3,7 @@ package notifier
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -120,6 +121,38 @@ func TestTypeFilter(t *testing.T) {
 	pushed := w.openedPushes()
 	if len(pushed) != 1 || pushed[0]["id"] != "4" {
 		t.Fatalf("只推回复：%v", pushed)
+	}
+}
+
+// 容器日志是自部署用户排查「推送没收到」的第一现场：每条新提醒记一行去向，交给中继后记一行汇总；
+// 正文和帖子标题不进日志。
+func TestIngestLogsEachOutcome(t *testing.T) {
+	w, _, run := setup(t, with(apiCfg, "types", []string{"reply"}))
+	w.notifications = []testNotification{replyNotification(1, w.sec()-100, "alice", 100, 3)}
+	run(0) // 基线取最新提醒的时间
+	w.logs = nil
+	w.notifications = append(w.notifications,
+		replyNotification(2, w.sec()+10, "alice", 100, 7),
+		thankNotification(3, w.sec()+11),
+		replyNotification(4, w.sec()-200, "carol", 100, 2), // 之前没出现过，但早于基线
+	)
+	run(30 * time.Second)
+	for _, want := range []string{
+		"新提醒 id=2（reply，alice，2026-09-29 00:00:10Z）：排队推送",
+		"新提醒 id=3（thank_reply，bob，2026-09-29 00:00:11Z）：类型不在推送范围，跳过",
+		"新提醒 id=4（reply，carol，2026-09-28 23:56:40Z）：早于基线，跳过",
+		"已交给中继 1 条推送",
+	} {
+		if !slices.Contains(w.logs, want) {
+			t.Errorf("缺少日志 %q，实际：\n%s", want, strings.Join(w.logs, "\n"))
+		}
+	}
+	for _, line := range w.logs {
+		for _, secret := range []string{"测试帖子", "另一个帖子", "@me", "我被感谢"} {
+			if strings.Contains(line, secret) {
+				t.Errorf("正文或标题进了日志：%s", line)
+			}
+		}
 	}
 }
 

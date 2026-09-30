@@ -124,6 +124,7 @@ type world struct {
 	feedStatus     int
 	// 记录
 	requests []string
+	logs     []string // 轮询程序打出的日志，warn 行带 [warn] 前缀
 }
 
 func newWorld(t *testing.T) *world {
@@ -318,10 +319,15 @@ func (m *memoryStore) state() *State {
 	return s
 }
 
-type testLogger struct{ t *testing.T }
+type testLogger struct{ w *world }
 
-func (l testLogger) Infof(f string, a ...any) { l.t.Logf(f, a...) }
-func (l testLogger) Warnf(f string, a ...any) { l.t.Logf("[warn] "+f, a...) }
+func (l testLogger) Infof(f string, a ...any) { l.w.log(fmt.Sprintf(f, a...)) }
+func (l testLogger) Warnf(f string, a ...any) { l.w.log("[warn] " + fmt.Sprintf(f, a...)) }
+
+func (w *world) log(line string) {
+	w.logs = append(w.logs, line)
+	w.t.Log(line)
+}
 
 func (w *world) newPoller(store Store) *Poller { return w.newPollerSharing(store, 1) }
 
@@ -334,7 +340,7 @@ func (w *world) newPollerSharing(store Store, apiShare int) *Poller {
 		Client:   &http.Client{Transport: w},
 		Version:  "test",
 		Now:      func() time.Time { return w.now },
-		Log:      testLogger{w.t},
+		Log:      testLogger{w},
 		Hostname: "nas-01",
 		APIShare: apiShare,
 	})

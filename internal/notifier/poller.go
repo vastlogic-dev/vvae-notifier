@@ -5,10 +5,12 @@ package notifier
 import (
 	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"runtime"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -419,17 +421,34 @@ func (p *Poller) ingest(items []Item) {
 	}
 	s.Seen = append(ids, s.Seen...)[:min(seenLimit, len(ids)+len(s.Seen))]
 	p.dirty = true
+	// 每条新提醒记一行去向，推送没收到时容器日志能答出这条推没推。
 	for _, it := range fresh {
-		if it.T < *s.BaselineT || !slices.Contains(cfg.Types, it.Type) {
-			continue
+		switch {
+		case it.T < *s.BaselineT:
+			p.log.Infof("新提醒 %s：早于基线，跳过", describe(it))
+		case !slices.Contains(cfg.Types, it.Type):
+			p.log.Infof("新提醒 %s：类型不在推送范围，跳过", describe(it))
+		default:
+			payload, err := buildNotification(cfg.Source, it)
+			if err != nil {
+				p.log.Warnf("新提醒 %s：装不进推送，已跳过：%v", describe(it), err)
+				continue
+			}
+			p.log.Infof("新提醒 %s：排队推送", describe(it))
+			p.enqueue(payload)
 		}
-		payload, err := buildNotification(cfg.Source, it)
-		if err != nil {
-			p.log.Warnf("一条提醒装不进推送，已跳过：%v", err)
-			continue
-		}
-		p.enqueue(payload)
 	}
+}
+
+// describe 在日志里标识一条提醒：id、类型、用户名、时间（UTC，和日志行首同一写法）。
+// 正文和帖子标题不进日志。
+func describe(it Item) string {
+	id, _, _ := strings.Cut(it.ID, "|") // Feed 的 id 后面拼了时间和用户名，这里另外列出
+	u := it.U
+	if u == "" {
+		u = "-"
+	}
+	return fmt.Sprintf("id=%s（%s，%s，%s）", id, it.Type, u, time.Unix(it.T, 0).UTC().Format("2006-01-02 15:04:05Z"))
 }
 
 // ---- 令牌过期检查（api 源）----
@@ -469,6 +488,7 @@ func (p *Poller) enqueue(plaintext []byte) {
 	s.Outbox = append(s.Outbox, p.box.Seal(PurposePush, plaintext))
 	if over := len(s.Outbox) - outboxLimit; over > 0 {
 		s.Outbox = s.Outbox[over:]
+		p.log.Warnf("待发推送超过 %d 条，丢弃最早的 %d 条", outboxLimit, over)
 	}
 	p.nextFlush = time.Time{}
 	p.dirty = true
@@ -476,29 +496,37 @@ func (p *Poller) enqueue(plaintext []byte) {
 
 func (p *Poller) flush() {
 	s := p.state
+	sent := 0
+	var rerr *relayError
 	for len(s.Outbox) > 0 {
-		rejected, rerr := p.relay.push(s.Outbox[0])
-		if rerr == nil {
-			if rejected != "" {
-				p.log.Warnf("中继拒收一条推送，已丢弃：%s", rejected)
-			}
-			s.Outbox = s.Outbox[1:]
-			p.dirty = true
-			continue
+		var rejected string
+		if rejected, rerr = p.relay.push(s.Outbox[0]); rerr != nil {
+			break
 		}
-		if rerr.kind == relayPayment {
-			p.log.Warnf("订阅无效，中继暂停转发，丢弃 %d 条待发推送", len(s.Outbox))
-			s.Outbox = nil
-			p.dirty = true
-			return
+		if rejected != "" {
+			p.log.Warnf("中继拒收一条推送，已丢弃：%s", rejected)
+		} else {
+			sent++
 		}
+		s.Outbox = s.Outbox[1:]
+		p.dirty = true
+	}
+	if sent > 0 {
+		p.log.Infof("已交给中继 %d 条推送", sent)
+	}
+	switch {
+	case rerr == nil:
+	case rerr.kind == relayPayment:
+		p.log.Warnf("订阅无效，中继暂停转发，丢弃 %d 条待发推送", len(s.Outbox))
+		s.Outbox = nil
+		p.dirty = true
+	default:
 		p.handleRelayError(rerr)
 		wait := time.Minute
 		if rerr.after > 0 {
 			wait = rerr.after
 		}
 		p.nextFlush = p.now().Add(wait)
-		return
 	}
 }
 
