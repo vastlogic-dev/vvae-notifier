@@ -1,0 +1,4 @@
+/vvae-notifier
+data/
+*.tmp
+.DS_Store

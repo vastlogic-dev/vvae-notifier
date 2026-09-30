@@ -1,0 +1,11 @@
+services:
+  vvae-notifier:
+    image: ghcr.io/vastlogic-dev/vvae-notifier:latest
+    restart: always
+    environment:
+      VVAE_KEY: ${VVAE_KEY}
+    volumes:
+      - data:/data
+
+volumes:
+  data:
