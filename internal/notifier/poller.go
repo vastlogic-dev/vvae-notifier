@@ -229,6 +229,7 @@ func (p *Poller) restoreConfig() {
 	}
 	p.config = cfg
 	p.setStatus(statusOK)
+	p.log.Infof("沿用本地保存的配置 %s", p.describeConfig(cfg))
 }
 
 func (p *Poller) appliedVersion() int {
@@ -280,11 +281,31 @@ func (p *Poller) applyConfig(cfg *Config, blob string) {
 	}
 	p.nextHeartbeat = time.Time{} // 尽快上报已应用的配置版本
 	p.dirty = true
+	p.log.Infof("已应用配置 %s", p.describeConfig(cfg))
+}
+
+// describeConfig 在日志里说明一版配置：间隔、哪些类型不推、哪台设备改的。
+// 「推送没收到」时只看容器日志就能答出是不是被类型开关挡掉、谁在什么时候关的。
+func (p *Poller) describeConfig(cfg *Config) string {
+	parts := []string{fmt.Sprintf("%s，间隔 %d 秒", cfg.Source, cfg.Interval)}
 	if iv := p.interval(cfg); iv > time.Duration(cfg.Interval)*time.Second {
-		p.log.Infof("已应用配置 v%d（%s，间隔 %d 秒；几个账号共用 V2EX 限额，实际 %d 秒）", cfg.V, cfg.Source, cfg.Interval, int(iv.Seconds()))
-	} else {
-		p.log.Infof("已应用配置 v%d（%s，间隔 %d 秒）", cfg.V, cfg.Source, cfg.Interval)
+		parts = append(parts, fmt.Sprintf("几个账号共用 V2EX 限额，实际 %d 秒", int(iv.Seconds())))
 	}
+	var skipped []string
+	for _, t := range AllTypes {
+		if !slices.Contains(cfg.Types, t) {
+			skipped = append(skipped, string(t))
+		}
+	}
+	if len(skipped) == 0 {
+		parts = append(parts, "推送全部类型")
+	} else {
+		parts = append(parts, "不推 "+strings.Join(skipped, "、"))
+	}
+	if cfg.By != "" {
+		parts = append(parts, "来自 "+cfg.By)
+	}
+	return fmt.Sprintf("v%d（%s）", cfg.V, strings.Join(parts, "；"))
 }
 
 // interval 是实际的轮询间隔：配置的间隔，API 源不短于共用限额算出的下限。

@@ -10,6 +10,8 @@ import (
 	"math"
 	"regexp"
 	"slices"
+	"strings"
+	"unicode"
 )
 
 type Source string
@@ -25,8 +27,9 @@ type Config struct {
 	PAT      string
 	FeedURL  string
 	Types    []ItemType
-	Interval int   // 秒
-	WarnDays []int // 从大到小
+	Interval int    // 秒
+	WarnDays []int  // 从大到小
+	By       string // 哪台设备上传的这一版，只进日志
 }
 
 var intervalLimits = map[Source]struct{ def, min int }{
@@ -83,6 +86,9 @@ func ParseConfig(data []byte) (*Config, error) {
 			}
 		}
 	}
+	if by, ok := o["by"].(string); ok {
+		cfg.By = logSafe(by, 120)
+	}
 	if n, ok := jsonInt(o["interval"]); ok {
 		cfg.Interval = min(3600, max(lim.min, n))
 	}
@@ -97,6 +103,17 @@ func ParseConfig(data []byte) (*Config, error) {
 		slices.Reverse(cfg.WarnDays)
 	}
 	return cfg, nil
+}
+
+// logSafe 去掉控制字符并截短：配置里的文本原样进日志，不能换行冒充别的日志行。
+func logSafe(s string, limit int) string {
+	r := []rune(strings.Map(func(c rune) rune {
+		if unicode.IsControl(c) {
+			return -1
+		}
+		return c
+	}, s))
+	return string(r[:min(len(r), limit)])
 }
 
 // sourceFingerprint 是轮询源与凭据的指纹：变了就重新记基线。

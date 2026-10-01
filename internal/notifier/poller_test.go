@@ -156,6 +156,27 @@ func TestIngestLogsEachOutcome(t *testing.T) {
 	}
 }
 
+// 配置日志要答出「为什么这类提醒没推」「谁在什么时候改的」：列出不推的类型和上传配置的设备，重启后也记一次。
+func TestConfigLogsTypesAndAuthor(t *testing.T) {
+	w, store, run := setup(t, with(apiCfg, "types", []string{"reply", "mention"}, "by", "iPhone tok=abcd1234 1.2.0 (700)\n伪造的一行"))
+	run(0)
+	want := "v1（api，间隔 30 秒；不推 thank_reply、thank_topic、favorite、other、unknown；来自 iPhone tok=abcd1234 1.2.0 (700)伪造的一行）"
+	if !slices.Contains(w.logs, "已应用配置 "+want) {
+		t.Errorf("缺少应用配置的日志，实际：\n%s", strings.Join(w.logs, "\n"))
+	}
+	w.logs = nil
+	w.newPoller(store)
+	if !slices.Contains(w.logs, "沿用本地保存的配置 "+want) {
+		t.Errorf("重启后缺少沿用配置的日志，实际：\n%s", strings.Join(w.logs, "\n"))
+	}
+
+	w2, _, run2 := setup(t, apiCfg)
+	run2(0)
+	if !slices.Contains(w2.logs, "已应用配置 v1（api，间隔 30 秒；推送全部类型）") {
+		t.Errorf("没有 types 时推送全部，实际：\n%s", strings.Join(w2.logs, "\n"))
+	}
+}
+
 func TestTokenInvalidOnceThenRecover(t *testing.T) {
 	w, _, run := setup(t, apiCfg)
 	run(0)
