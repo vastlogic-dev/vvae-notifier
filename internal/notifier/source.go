@@ -4,7 +4,6 @@ package notifier
 
 import (
 	"errors"
-	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -51,11 +50,12 @@ func fetchFailed(detail string) fetchResult {
 // 正文上限：提醒 Feed 约 33KB，通知接口约 8KB，远低于它。
 const maxBody = 4 << 20
 
-// getV2EX 发 GET。UA 自报，不伪装浏览器；分类依赖中文动作文案，所以固定请求中文。
-func (p *Poller) getV2EX(rawURL, etag, bearer string) (*http.Response, error) {
+// getV2EX 发 GET 并读完正文，网络层出错时换新连接重发一次（GET 重发没有副作用）。
+// UA 自报，不伪装浏览器；分类依赖中文动作文案，所以固定请求中文。
+func (p *Poller) getV2EX(rawURL, etag, bearer string) (response, error) {
 	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, err
+		return response{}, err
 	}
 	req.Header.Set("User-Agent", p.userAgent)
 	req.Header.Set("Accept-Language", "zh-CN,zh")
@@ -65,11 +65,7 @@ func (p *Poller) getV2EX(rawURL, etag, bearer string) (*http.Response, error) {
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
-	return p.client.Do(req)
-}
-
-func readBody(res *http.Response) ([]byte, error) {
-	return io.ReadAll(io.LimitReader(res.Body, maxBody))
+	return p.sender.send(req, maxBody, true)
 }
 
 func rateInfo(h http.Header) (remaining, resetAt int64) {

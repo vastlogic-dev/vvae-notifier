@@ -30,6 +30,9 @@ const (
 	apiHourlyBudget = 600 * 7 / 10
 	// 提醒源连续这么多次返回空正文才判失效（间隔按错误退避，约 6 分钟，超过边缘缓存的 150 秒）。
 	emptyConfirm = 3
+	// 轮询连续失败这么多次才上报 error，之前保持原状态。偶发的断线、522 下一轮多半就好，不让 App 里的状态来回跳。
+	// 失败后按退避拉长间隔（2 倍、4 倍），第 3 次失败在第一次之后约 3 分钟（API 默认 30 秒）或 6 分钟（Feed 60 秒）。
+	errorConfirm = 3
 )
 
 // 心跳里上报的状态，App 据此显示轮询程序是否正常。
@@ -67,7 +70,7 @@ type Options struct {
 
 type Poller struct {
 	store     Store
-	client    *http.Client
+	sender    sender
 	userAgent string
 	version   string
 	now       func() time.Time
@@ -106,6 +109,7 @@ func New(o Options) (*Poller, error) {
 		o.Log = nopLogger{}
 	}
 	ua := "vvae-notifier/" + o.Version
+	send := sender{client: o.Client, log: o.Log}
 	inst := make([]byte, 16)
 	if _, err := rand.Read(inst); err != nil {
 		return nil, err
@@ -114,13 +118,13 @@ func New(o Options) (*Poller, error) {
 		inst:       b64.EncodeToString(inst),
 		meta:       instanceMeta(box, o.Hostname, o.Now()),
 		store:      o.Store,
-		client:     o.Client,
+		sender:     send,
 		userAgent:  ua,
 		version:    o.Version,
 		now:        o.Now,
 		log:        o.Log,
 		box:        box,
-		relay:      &relayClient{base: o.Deploy.Relay, pushKey: o.Deploy.PushKey, userAgent: ua, client: o.Client},
+		relay:      &relayClient{base: o.Deploy.Relay, pushKey: o.Deploy.PushKey, userAgent: ua, sender: send},
 		status:     statusNoConfig,
 		wantConfig: true,
 		apiFloor:   time.Duration((3600*max(o.APIShare, 1)+apiHourlyBudget-1)/apiHourlyBudget) * time.Second,
@@ -338,6 +342,9 @@ func (p *Poller) poll() {
 		}
 	}
 
+	if r.kind != fetchError {
+		p.errorStreak = 0 // V2EX 给了明确答复（含 401、429），连续失败就断了
+	}
 	switch r.kind {
 	case fetchOK:
 		if r.etag != s.ETag {
@@ -369,10 +376,14 @@ func (p *Poller) poll() {
 		}
 		p.log.Warnf("V2EX 限流，暂停到限额重置")
 	case fetchError:
-		p.setStatus(statusError)
 		p.errorStreak++
 		next = now.Add(min(maxBackoff, interval<<min(p.errorStreak, 16)))
-		p.log.Warnf("轮询失败：%s", r.detail)
+		if p.errorStreak < errorConfirm {
+			p.log.Infof("轮询失败（连续 %d 次，满 %d 次才上报出错）：%s", p.errorStreak, errorConfirm, r.detail)
+		} else {
+			p.setStatus(statusError)
+			p.log.Warnf("轮询失败（连续 %d 次，已上报出错）：%s", p.errorStreak, r.detail)
+		}
 	}
 	if (r.kind == fetchOK || r.kind == fetchNotModified) && r.remaining >= 0 && r.remaining < lowRemaining && r.resetAt > 0 {
 		next = later(next, time.Unix(r.resetAt, 0))
@@ -389,7 +400,6 @@ func later(a, b time.Time) time.Time {
 
 func (p *Poller) markHealthy(now time.Time) {
 	p.setStatus(statusOK)
-	p.errorStreak = 0
 	p.emptyStreak = 0
 	if p.state.InvalidNotified {
 		p.state.InvalidNotified = false

@@ -28,11 +28,12 @@ type relayError struct {
 
 type relayClient struct {
 	base, pushKey, userAgent string
-	client                   *http.Client
+	sender
 }
 
 // call 发请求并读完正文。401、402、429、5xx 与网络错误归为 relayError。
-func (r *relayClient) call(method, path string, body any, ifNoneMatch string) (int, []byte, *relayError) {
+// replay：网络层出错时是否换新连接立即重发一次，只给重发没有副作用的请求。
+func (r *relayClient) call(method, path string, body any, ifNoneMatch string, replay bool) (int, []byte, *relayError) {
 	var rd io.Reader
 	if body != nil {
 		rd = bytes.NewReader(marshal(body))
@@ -49,27 +50,23 @@ func (r *relayClient) call(method, path string, body any, ifNoneMatch string) (i
 	if ifNoneMatch != "" {
 		req.Header.Set("If-None-Match", ifNoneMatch)
 	}
-	res, err := r.client.Do(req)
+	res, err := r.send(req, 64<<10, replay)
 	if err != nil {
 		return 0, nil, &relayError{kind: relayRetry, detail: netDetail(err)}
 	}
-	defer res.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(res.Body, 64<<10))
 	switch {
-	case res.StatusCode == http.StatusUnauthorized:
+	case res.status == http.StatusUnauthorized:
 		return 0, nil, &relayError{kind: relayRevoked}
-	case res.StatusCode == http.StatusPaymentRequired:
+	case res.status == http.StatusPaymentRequired:
 		return 0, nil, &relayError{kind: relayPayment}
-	case res.StatusCode == http.StatusTooManyRequests || res.StatusCode >= 500:
-		e := &relayError{kind: relayRetry, detail: fmt.Sprintf("HTTP %d", res.StatusCode)}
-		if s, err := strconv.Atoi(res.Header.Get("Retry-After")); err == nil && s > 0 {
+	case res.status == http.StatusTooManyRequests || res.status >= 500:
+		e := &relayError{kind: relayRetry, detail: fmt.Sprintf("HTTP %d", res.status)}
+		if s, err := strconv.Atoi(res.header.Get("Retry-After")); err == nil && s > 0 {
 			e.after = time.Duration(min(s, 3600)) * time.Second // 最多等一小时
 		}
 		return 0, nil, e
-	case err != nil:
-		return 0, nil, &relayError{kind: relayRetry, detail: netDetail(err)}
 	}
-	return res.StatusCode, data, nil
+	return res.status, res.body, nil
 }
 
 type configReply struct {
@@ -85,7 +82,7 @@ func (r *relayClient) getConfig(have int) (configReply, *relayError) {
 	if have > 0 {
 		etag = fmt.Sprintf(`"%d"`, have)
 	}
-	status, data, rerr := r.call(http.MethodGet, "/v1/config", nil, etag)
+	status, data, rerr := r.call(http.MethodGet, "/v1/config", nil, etag, true)
 	switch {
 	case rerr != nil:
 		return configReply{}, rerr
@@ -107,8 +104,10 @@ func (r *relayClient) getConfig(have int) (configReply, *relayError) {
 }
 
 // push 返回非空 rejected 表示中继明确拒收这一条（如 413），重试也没用，应丢弃。
+// 网络出错时不立即重发：请求可能已经到了中继、只是回复丢了，而中继不去重，重发会让用户收到两条。
+// 这条留在待发队列里，约 1 分钟后照常再发（flush）；即时重发只快这一点，不值得多开一条会重复的路。
 func (r *relayClient) push(blob string) (rejected string, rerr *relayError) {
-	status, _, rerr := r.call(http.MethodPost, "/v1/push", map[string]string{"blob": blob}, "")
+	status, _, rerr := r.call(http.MethodPost, "/v1/push", map[string]string{"blob": blob}, "", false)
 	switch {
 	case rerr != nil:
 		return "", rerr
@@ -131,8 +130,9 @@ type heartbeatBody struct {
 }
 
 // heartbeat 返回中继上的最新配置版本，没有时为 0。
+// 网络出错时立即重发：重复的心跳只是再记一次同样的状态，「已连接」提醒中继只发一次。
 func (r *relayClient) heartbeat(hb heartbeatBody) (int, *relayError) {
-	status, data, rerr := r.call(http.MethodPost, "/v1/heartbeat", hb, "")
+	status, data, rerr := r.call(http.MethodPost, "/v1/heartbeat", hb, "", true)
 	if rerr != nil {
 		return 0, rerr
 	}

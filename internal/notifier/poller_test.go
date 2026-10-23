@@ -406,3 +406,129 @@ func TestPaymentRequiredDropsOutbox(t *testing.T) {
 		t.Fatalf("订阅无效时丢弃待发推送：%d", n)
 	}
 }
+
+// polls 记完基线，返回一个函数：推进到下一次请求 V2EX 并跑完那一轮，返回这一轮请求 V2EX 的次数（含立即重发）。
+func polls(w *world, run func(time.Duration) time.Duration) func() int {
+	next := run(0)
+	return func() int {
+		before := w.v2exRequests()
+		for w.v2exRequests() == before {
+			next = run(next)
+		}
+		return w.v2exRequests() - before
+	}
+}
+
+// 长连接在途中被切断（响应前、正文读到一半）：关掉空闲连接、立即重发一次，这一轮照常完成，不上报出错。
+func TestDroppedConnectionRetried(t *testing.T) {
+	for _, fault := range []string{"conn", "body"} {
+		t.Run(fault, func(t *testing.T) {
+			w, _, run := setup(t, apiCfg)
+			poll := polls(w, run)
+			w.notifications = []testNotification{replyNotification(1, w.sec()+1, "alice", 100, 3)}
+			w.v2exFaults = []string{fault}
+			if n := poll(); n != 2 {
+				t.Fatalf("断线后立即重发一次：请求 %d 次", n)
+			}
+			if w.idleCloses != 1 {
+				t.Fatalf("重发前关掉空闲连接：%d 次", w.idleCloses)
+			}
+			if len(w.pushes) != 1 {
+				t.Fatalf("重发拿到的新提醒照常推送：%d 条", len(w.pushes))
+			}
+			for _, hb := range w.heartbeats {
+				if hb.State != statusOK {
+					t.Fatalf("重发成功不上报出错：%s", hb.State)
+				}
+			}
+			if !slices.Contains(w.logs, "请求 www.v2ex.com 时网络出错（unexpected EOF），已换新连接重试") {
+				t.Errorf("缺少重试日志，实际：\n%s", strings.Join(w.logs, "\n"))
+			}
+			for _, line := range w.logs {
+				if strings.HasPrefix(line, "[warn]") {
+					t.Errorf("重发成功不记 warn：%s", line)
+				}
+			}
+		})
+	}
+}
+
+// 轮询失败（如 522）不立即重发；连续 3 次才上报 error，之前保持原状态；成功一次计数清零。
+func TestErrorReportedAfterConsecutiveFailures(t *testing.T) {
+	w, _, run := setup(t, apiCfg)
+	poll := polls(w, run)
+	fail := func() {
+		t.Helper()
+		if n := poll(); n != 1 {
+			t.Fatalf("收到状态码不立即重发：请求 %d 次", n)
+		}
+	}
+	w.apiStatus = 522
+	fail()
+	fail()
+	w.apiStatus = 0
+	poll() // 成功一次，计数清零
+	w.apiStatus = 522
+	fail()
+	fail()
+	for _, hb := range w.heartbeats {
+		if hb.State != statusOK {
+			t.Fatalf("连续失败不满 3 次不上报：%s", hb.State)
+		}
+	}
+	for _, line := range w.logs {
+		if strings.HasPrefix(line, "[warn]") {
+			t.Fatalf("不满 3 次不记 warn：%s", line)
+		}
+	}
+	fail()
+	if hb := w.lastHeartbeat(); hb.State != statusError {
+		t.Fatalf("连续 3 次失败上报出错：%s", hb.State)
+	}
+	if !slices.Contains(w.logs, "[warn] 轮询失败（连续 3 次，已上报出错）：HTTP 522") {
+		t.Errorf("上报出错时记 warn 并带次数，实际：\n%s", strings.Join(w.logs, "\n"))
+	}
+}
+
+// 明确的状态不去抖：之前有不满阈值的失败，401 也在同一轮立即上报 token_invalid。
+func TestTokenInvalidNotDebounced(t *testing.T) {
+	w, _, run := setup(t, apiCfg)
+	poll := polls(w, run)
+	w.apiStatus = 522
+	poll()
+	w.apiStatus = 401
+	beats := len(w.heartbeats)
+	poll()
+	if len(w.heartbeats) == beats || w.lastHeartbeat().State != statusTokenInvalid {
+		t.Fatalf("401 当轮上报 token_invalid：%+v", w.heartbeats[beats:])
+	}
+}
+
+// 中继断线：心跳立即重发（重复无害）；推送不立即重发（中继不去重），留在待发队列，下一轮只送达一次。
+func TestRelayDropRetriesHeartbeatNotPush(t *testing.T) {
+	w, store, run := setup(t, apiCfg)
+	run(0)
+	beats := len(w.heartbeats)
+	w.relayFaults = 1
+	run(5 * time.Minute)
+	if len(w.heartbeats) != beats+1 {
+		t.Fatalf("心跳断线后立即重发：%d 次", len(w.heartbeats)-beats)
+	}
+
+	w.notifications = []testNotification{replyNotification(1, w.sec()+1, "alice", 100, 3)}
+	w.relayFaults = 1
+	run(30 * time.Second)
+	pushReqs := 0
+	for _, r := range w.requests {
+		if r == "POST "+testRelay+"/v1/push" {
+			pushReqs++
+		}
+	}
+	if pushReqs != 1 || len(store.state().Outbox) != 1 {
+		t.Fatalf("推送断线后不立即重发、留在队列：请求 %d 次，队列 %d 条", pushReqs, len(store.state().Outbox))
+	}
+	run(time.Minute)
+	if len(w.pushes) != 1 || len(store.state().Outbox) != 0 {
+		t.Fatalf("下一轮补发一次：送达 %d 条，队列 %d 条", len(w.pushes), len(store.state().Outbox))
+	}
+}

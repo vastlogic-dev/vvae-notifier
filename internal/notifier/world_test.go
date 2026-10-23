@@ -3,6 +3,7 @@ package notifier
 // 测试用的假世界：可控时钟、假中继、假 V2EX（API v2 与提醒 Feed）。样本数据全部编造。
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 )
 
@@ -122,9 +124,13 @@ type world struct {
 	tokenExpiresAt int64
 	feed           string
 	feedStatus     int
+	// 断线：接下来的请求按顺序出错，用完为止
+	v2exFaults  []string // 请求 V2EX："conn" 响应前连接断开，"body" 正文读到一半断开
+	relayFaults int      // 请求中继：响应前连接断开
 	// 记录
-	requests []string
-	logs     []string // 轮询程序打出的日志，warn 行带 [warn] 前缀
+	requests   []string
+	logs       []string // 轮询程序打出的日志，warn 行带 [warn] 前缀
+	idleCloses int      // 关闭空闲连接的次数
 }
 
 func newWorld(t *testing.T) *world {
@@ -200,15 +206,37 @@ func (w *world) RoundTrip(req *http.Request) (*http.Response, error) {
 	w.requests = append(w.requests, req.Method+" "+u)
 	switch {
 	case strings.HasPrefix(u, testRelay):
+		if w.relayFaults > 0 {
+			w.relayFaults--
+			return nil, io.EOF
+		}
 		return w.relayResponse(req, strings.TrimPrefix(u, testRelay))
 	case strings.HasPrefix(u, apiBase+"/"):
-		return w.apiResponse(req), nil
+		return w.v2exFault(w.apiResponse(req))
 	case strings.HasPrefix(u, "https://www.v2ex.com/n/"):
-		return w.feedResponse(req), nil
+		return w.v2exFault(w.feedResponse(req))
 	}
 	w.t.Fatalf("意外的请求：%s", u)
 	return nil, nil
 }
+
+// v2exFault 按 v2exFaults 让这次请求断线，模拟长连接在途中被切断。
+func (w *world) v2exFault(res *http.Response) (*http.Response, error) {
+	if len(w.v2exFaults) == 0 {
+		return res, nil
+	}
+	fault := w.v2exFaults[0]
+	w.v2exFaults = w.v2exFaults[1:]
+	if fault == "conn" {
+		return nil, io.ErrUnexpectedEOF
+	}
+	data, _ := io.ReadAll(res.Body)
+	res.Body = io.NopCloser(io.MultiReader(bytes.NewReader(data[:len(data)/2]), iotest.ErrReader(io.ErrUnexpectedEOF)))
+	return res, nil
+}
+
+// CloseIdleConnections：http.Client.CloseIdleConnections 转到这里。
+func (w *world) CloseIdleConnections() { w.idleCloses++ }
 
 func (w *world) relayResponse(req *http.Request, path string) (*http.Response, error) {
 	if w.relayDown {

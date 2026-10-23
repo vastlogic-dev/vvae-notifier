@@ -77,27 +77,22 @@ func (p *Poller) fetchNotifications(pat, etag string) fetchResult {
 	if err != nil {
 		return fetchFailed(netDetail(err))
 	}
-	defer res.Body.Close()
-	remaining, resetAt := rateInfo(res.Header)
+	remaining, resetAt := rateInfo(res.header)
 	switch {
-	case res.StatusCode == http.StatusNotModified:
+	case res.status == http.StatusNotModified:
 		return fetchResult{kind: fetchNotModified, remaining: remaining, resetAt: resetAt}
-	case res.StatusCode == http.StatusUnauthorized:
+	case res.status == http.StatusUnauthorized:
 		return fetchResult{kind: fetchInvalid, remaining: -1, resetAt: -1}
-	case res.StatusCode == http.StatusTooManyRequests:
+	case res.status == http.StatusTooManyRequests:
 		return fetchResult{kind: fetchRateLimited, remaining: -1, resetAt: resetAt}
-	case res.StatusCode/100 != 2:
-		return fetchFailed(fmt.Sprintf("HTTP %d", res.StatusCode))
-	}
-	data, err := readBody(res)
-	if err != nil {
-		return fetchFailed(netDetail(err))
+	case res.status/100 != 2:
+		return fetchFailed(fmt.Sprintf("HTTP %d", res.status))
 	}
 	var body struct {
 		Success bool              `json:"success"`
 		Result  []json.RawMessage `json:"result"`
 	}
-	if json.Unmarshal(data, &body) != nil {
+	if json.Unmarshal(res.body, &body) != nil {
 		return fetchFailed("响应不是 JSON")
 	}
 	if !body.Success || body.Result == nil {
@@ -114,7 +109,7 @@ func (p *Poller) fetchNotifications(pat, etag string) fetchResult {
 			items = append(items, it)
 		}
 	}
-	return fetchResult{kind: fetchOK, etag: res.Header.Get("Etag"), items: items, remaining: remaining, resetAt: resetAt}
+	return fetchResult{kind: fetchOK, etag: res.header.Get("Etag"), items: items, remaining: remaining, resetAt: resetAt}
 }
 
 type tokenInfo struct {
@@ -129,16 +124,11 @@ func (p *Poller) fetchTokenInfo(pat string) tokenInfo {
 	if err != nil {
 		return tokenInfo{err: netDetail(err)}
 	}
-	defer res.Body.Close()
-	if res.StatusCode == http.StatusUnauthorized {
+	if res.status == http.StatusUnauthorized {
 		return tokenInfo{invalid: true}
 	}
-	if res.StatusCode/100 != 2 {
-		return tokenInfo{err: fmt.Sprintf("HTTP %d", res.StatusCode)}
-	}
-	data, err := readBody(res)
-	if err != nil {
-		return tokenInfo{err: netDetail(err)}
+	if res.status/100 != 2 {
+		return tokenInfo{err: fmt.Sprintf("HTTP %d", res.status)}
 	}
 	var body struct {
 		Result struct {
@@ -146,7 +136,7 @@ func (p *Poller) fetchTokenInfo(pat string) tokenInfo {
 			Expiration *int64 `json:"expiration"`
 		} `json:"result"`
 	}
-	if json.Unmarshal(data, &body) != nil || body.Result.Created == nil || body.Result.Expiration == nil {
+	if json.Unmarshal(res.body, &body) != nil || body.Result.Created == nil || body.Result.Expiration == nil {
 		return tokenInfo{err: "缺少 created/expiration"}
 	}
 	return tokenInfo{expiresAt: *body.Result.Created + *body.Result.Expiration}

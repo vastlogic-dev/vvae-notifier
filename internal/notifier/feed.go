@@ -112,22 +112,18 @@ func (p *Poller) fetchFeed(feedURL, etag string) fetchResult {
 	if err != nil {
 		return fetchFailed(netDetail(err))
 	}
-	defer res.Body.Close()
-	remaining, resetAt := rateInfo(res.Header)
+	remaining, resetAt := rateInfo(res.header)
 	switch {
-	case res.StatusCode == http.StatusNotModified:
+	case res.status == http.StatusNotModified:
 		return fetchResult{kind: fetchNotModified, remaining: remaining, resetAt: resetAt}
-	case res.StatusCode == http.StatusNotFound:
+	case res.status == http.StatusNotFound:
 		return fetchResult{kind: fetchInvalid, remaining: -1, resetAt: -1}
-	case res.StatusCode == http.StatusTooManyRequests:
+	case res.status == http.StatusTooManyRequests:
 		return fetchResult{kind: fetchRateLimited, remaining: -1, resetAt: resetAt}
-	case res.StatusCode/100 != 2:
-		return fetchFailed(fmt.Sprintf("HTTP %d", res.StatusCode))
+	case res.status/100 != 2:
+		return fetchFailed(fmt.Sprintf("HTTP %d", res.status))
 	}
-	data, err := readBody(res)
-	if err != nil {
-		return fetchFailed(netDetail(err))
-	}
+	data := res.body
 	// 令牌不存在（被「重新生成 Token」作废）时，V2EX 返回 200 和空正文，不是 404。
 	if len(bytes.TrimSpace(data)) == 0 {
 		return fetchResult{kind: fetchInvalid, remaining: -1, resetAt: -1, empty: true}
@@ -135,5 +131,5 @@ func (p *Poller) fetchFeed(feedURL, etag string) fetchResult {
 	if !bytes.Contains(data, []byte("<feed")) {
 		return fetchFailed("响应不是 Atom Feed")
 	}
-	return fetchResult{kind: fetchOK, etag: res.Header.Get("Etag"), items: parseFeed(string(data)), remaining: remaining, resetAt: resetAt}
+	return fetchResult{kind: fetchOK, etag: res.header.Get("Etag"), items: parseFeed(string(data)), remaining: remaining, resetAt: resetAt}
 }
